@@ -1,0 +1,186 @@
+---
+# yamllint disable rule:line-length
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+
+  AllowedIPs:
+    Description: 'https://checkip.amazonaws.com'
+    Type: String
+    AllowedPattern: '^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])(\/([0-9]|[1-2][0-9]|3[0-2]))$'
+    Default: '0.0.0.0/0'
+
+  AMI:
+    Description: The AMI ID
+    Type: 'AWS::EC2::Image::Id'
+
+  HostName:
+    Default: "workstation"
+    Description: The value used for the Name tag and the hostname
+    Type: String
+
+  AlternateIAMRole:
+    Description: An existing IAM Role name to attach the instance. If not supplied a default is used.
+    Type: String
+    Default: ''
+
+  InstanceType:
+    Description: Pick an instance size
+    Default: t3.large
+    Type: String
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - t3.2xlarge
+
+  InstanceTypeOther:
+    Description: You supply the instance size
+    Type: String
+    Default: ''
+
+  KeyPairName:
+    Description: Name of an existing public/private key pair. If you do not have a key pair in this region,
+      please create it before continuing.
+    Type: 'AWS::EC2::KeyPair::KeyName'
+
+  RootVolumeSize:
+    Description: The size in GB for the root EBS volume.
+    Type: Number
+    Default: '40'
+
+  SecurityGroupOther:
+    Description: A custom security group you have already created
+    Type: String
+    Default: ''
+
+  Subnet:
+    Description: The subnet into which the instance will be provisioned
+    Type: 'AWS::EC2::Subnet::Id'
+
+  VPC:
+    Description: 'ID of the VPC (e.g., vpc-0343606e).'
+    Type: 'AWS::EC2::VPC::Id'
+
+Conditions:
+
+  CreateIAMRole: !Equals [!Ref AlternateIAMRole, '']
+
+  CreateSecurityGroup: !Equals [!Ref SecurityGroupOther, '']
+
+  CustomInstanceTypeSupplied: !Not [!Equals [!Ref InstanceTypeOther, '']]
+
+Resources:
+
+  Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: !Ref AMI
+      InstanceType: !If [CustomInstanceTypeSupplied, !Ref InstanceTypeOther, !Ref InstanceType]
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref Subnet
+      SecurityGroupIds:
+        - !If [CreateSecurityGroup, !Ref SecurityGroup, !Ref SecurityGroup]
+      BlockDeviceMappings:
+        - DeviceName: '/dev/sda1'
+          Ebs:
+            VolumeType: 'gp2'
+            DeleteOnTermination: true
+            VolumeSize: !Ref RootVolumeSize
+      Tags:
+        - Key: Name
+          Value: !Ref HostName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/usr/bin/env bash
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource Instance --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? "${WaitHandle}"
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          files:
+            '/usr/local/sbin/initialize-system.sh':
+              mode: '000755'
+              content:
+                Fn::Sub: |
+                  #!/usr/bin/env bash
+                  set -e
+
+                  hostnamectl set-hostname "${HostName}"
+            '/etc/cfn/cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+            '/etc/cfn/hooks.d/cfn-auto-reloader.conf':
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.Server.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --region ${AWS::Region} --resource Instance
+                runas=root
+            '/etc/cron.hourly/os-update':
+              mode: '000755'
+              content: |
+                #!/usr/bin/env bash
+                yum -y update > /dev/null
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+          commands:
+            '01_init':
+              command: '/bin/bash -x /usr/local/sbin/initialize-system.sh'
+
+  PeopleSoftInstanceWaitForInit:
+    Type: 'AWS::CloudFormation::WaitCondition'
+    DependsOn: Instance
+    Properties:
+      Count: 1
+      Handle: !Ref WaitHandle
+      Timeout: '600'
+
+  WaitHandle:
+    Type: 'AWS::CloudFormation::WaitConditionHandle'
+
+  InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !If [CreateIAMRole, !Ref InstanceRole, !Ref AlternateIAMRole]
+
+  SecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Allow SSH and RDP access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedIPs
+        - IpProtocol: tcp
+          FromPort: 3389
+          ToPort: 3389
+          CidrIp: !Ref AllowedIPs
+
+  InstanceRole:
+    Condition: CreateIAMRole
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - 'ec2.amazonaws.com'
+            Effect: Allow
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM'
